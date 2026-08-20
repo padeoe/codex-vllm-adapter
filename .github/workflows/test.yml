@@ -1,0 +1,22 @@
+# The whole point of the adapter design: this CI needs no GPU and no vLLM.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests -v
+      - name: import check
+        run: python -c "import codex_vllm_adapter; print(codex_vllm_adapter.__version__)"

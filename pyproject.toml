@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-vllm-adapter"
+version = "0.1.0"
+description = "Run OpenAI Codex CLI against stock vLLM, without patching vLLM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+keywords = ["codex", "vllm", "openai", "responses-api", "qwen", "llm", "proxy"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# No runtime dependencies, on purpose: the adapter must be trivial to install next to an
+# existing vLLM deployment, including inside the vLLM container itself.
+dependencies = []
+
+[project.scripts]
+codex-vllm-adapter = "codex_vllm_adapter.proxy:main"
+
+[project.urls]
+Homepage = "https://github.com/padeoe/codex-vllm-adapter"
+Issues = "https://github.com/padeoe/codex-vllm-adapter/issues"
+
+[tool.setuptools]
+packages = ["codex_vllm_adapter"]
