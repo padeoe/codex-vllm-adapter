@@ -1,0 +1,13 @@
+{
+  "_comment": "JSON twin of thinking.toml, for Python < 3.11 (tomllib is 3.11+). Values: off | on | keep | an effort name. See examples/thinking.toml for the full explanation.",
+  "thinking": {
+    "default": "off",
+    "none": "off",
+    "minimal": "off",
+    "low": "off",
+    "medium": "off",
+    "high": "off",
+    "xhigh": "off",
+    "max": "off"
+  }
+}

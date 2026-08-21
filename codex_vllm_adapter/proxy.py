@@ -26,6 +26,13 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .sanitize import sanitize_request
+from .thinking import (
+    DEFAULT_POLICY,
+    PASSTHROUGH_POLICY,
+    PolicyError,
+    apply_thinking_policy,
+    load_policy,
+)
 
 logger = logging.getLogger("codex-vllm-adapter")
 
@@ -46,6 +53,7 @@ class Handler(BaseHTTPRequestHandler):
     upstream = "http://127.0.0.1:8000"
     verbose = False
     extra_drop_types = frozenset()
+    thinking_policy = DEFAULT_POLICY
 
     def log_message(self, fmt, *args):  # noqa: A003 - silence default stderr spam
         logger.debug("%s - %s", self.address_string(), fmt % args)
@@ -127,6 +135,8 @@ class Handler(BaseHTTPRequestHandler):
             # Not JSON: forward untouched rather than guessing.
             return body
         new, stats = sanitize_request(parsed, self.extra_drop_types)
+        new, tstats = apply_thinking_policy(new, self.thinking_policy)
+        stats.update(tstats)
         if not stats:
             return body
         if self.verbose:
@@ -145,6 +155,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="vLLM base URL (default: http://127.0.0.1:8000)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="log what was removed from each request")
+    ap.add_argument("--thinking", default=None, metavar="MODE",
+                    help="thinking policy shorthand: 'off' (default) disables thinking "
+                         "at every effort level; 'on' follows the client's effort, "
+                         "clamped to a name Qwen's template accepts; 'keep' injects "
+                         "nothing and lets vLLM decide. For per-level control use "
+                         "--thinking-config.")
+    ap.add_argument("--thinking-config", default=None, metavar="PATH",
+                    help="JSON or TOML file mapping each reasoning effort to off / on / "
+                         "keep / an effort name. See examples/thinking.toml.")
     ap.add_argument("--drop-item-type", action="append", default=[], metavar="TYPE",
                     help="also drop input items of this type (repeatable). Use when a "
                          "new item type causes a 500 whose traceback ends in "
@@ -155,10 +174,27 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    if args.thinking and args.thinking_config:
+        ap.error("--thinking and --thinking-config are mutually exclusive")
+    try:
+        if args.thinking_config:
+            policy = load_policy(args.thinking_config)
+        elif args.thinking is None or args.thinking == "off":
+            policy = DEFAULT_POLICY
+        elif args.thinking == "on":
+            policy = PASSTHROUGH_POLICY
+        elif args.thinking == "keep":
+            policy = None
+        else:
+            ap.error("--thinking must be one of: off, on, keep")
+    except (PolicyError, OSError) as e:
+        ap.error(str(e))
+
     host, _, port = args.listen.rpartition(":")
     Handler.upstream = args.upstream
     Handler.verbose = args.verbose
     Handler.extra_drop_types = frozenset(args.drop_item_type)
+    Handler.thinking_policy = policy
 
     srv = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
     srv.daemon_threads = True

@@ -1,31 +1,50 @@
 #!/usr/bin/env python3
-"""Patch the Qwen3.8 chat template so it accepts the OpenAI Responses API 'developer' role.
+"""Patch a Qwen3.5/3.8 chat template so it accepts Codex's `developer` role.
 
-The stock template raises 'Unexpected message role.' for role=developer (Codex sends one),
-and raises 'System message must be at the beginning.' when vLLM turns the Responses
-'instructions' field into a leading system message *and* a developer message follows it.
+Usage:
+    python tools/patch_chat_template.py SRC.jinja DST.jinja [options]
+    vllm serve ... --chat-template DST.jinja
 
-This patch folds every leading system/developer message into one system message.
+`--chat-template` is a supported vLLM flag, so this is configuration, not a fork.
+
+What is patched by default (and why it cannot be done from the adapter)
+-----------------------------------------------------------------------
+The Responses API has no `system` role; it has `instructions` plus items with role
+`developer`. vLLM renders `instructions` into a leading system message, and Codex also
+sends a developer message. The stock template then fails twice over:
+
+    Unexpected message role.                    <- role=developer is not handled
+    System message must be at the beginning.    <- system followed by developer
+
+Both are *rendering* decisions that live in the template. This patch folds every leading
+system/developer message into one system message, and renders a stray later developer
+message as a user turn instead of raising.
+
+What is NOT patched by default
+------------------------------
+Thinking. It used to be hardcoded off here, which was a build-time answer to a run-time
+question: the stock template already gates its whole reasoning block on
+`enable_thinking`, and the adapter sets that per request from a policy file. Leave this
+alone and control thinking with `--thinking` / `--thinking-config`.
+
+The flags below exist for people not running the adapter, or running a client that
+sends efforts the adapter is not configured to remap.
 """
-import os
+
+from __future__ import annotations
+
+import argparse
 import sys
 
-SRC = sys.argv[1] if len(sys.argv) > 1 else \
-    "/data/pretrained_models/Qwen3.8-27B-FP8/chat_template.jinja"
-DST = sys.argv[2] if len(sys.argv) > 2 else \
-    "/home/padeoe/deploy/qwen38/chat_template.codex.jinja"
+# --- 1. developer role ------------------------------------------------------------
 
-t = open(SRC, encoding="utf-8").read()
-
-ANCHOR = (
+ANCHOR_NO_MESSAGES = (
     "{%- if not messages %}\n"
     "    {{- raise_exception('No messages provided.') }}\n"
     "{%- endif %}"
 )
-if ANCHOR not in t:
-    sys.exit("anchor 1 (no-messages guard) not found -- template changed upstream")
 
-NORM = ANCHOR + """
+FOLD_LEADING = ANCHOR_NO_MESSAGES + """
 {#- PATCH: fold leading system/developer messages into a single system message. -#}
 {%- set _norm = namespace(parts=[], rest=[], head=true) %}
 {%- for _m in messages %}
@@ -48,36 +67,19 @@ NORM = ANCHOR + """
     {{- raise_exception('No messages provided.') }}
 {%- endif %}"""
 
-t = t.replace(ANCHOR, NORM, 1)
+USER_BRANCH_OLD = """    {%- elif message.role == "user" %}
+        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}"""
+USER_BRANCH_NEW = """    {%- elif message.role == "user" or message.role == "developer" %}
+        {{- '<|im_start|>user\\n' + content + '<|im_end|>' + '\\n' }}"""
 
-# Clamp unknown reasoning efforts instead of raising. Codex may send levels that belong
-# to whichever model it thinks it is talking to (e.g. `high`, `minimal`); the stock
-# template hard-fails on anything outside low/medium/xhigh.
+# --- 2. optional: tolerate unknown reasoning efforts --------------------------------
+
 EFFORT_OLD = """    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}
     {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
         {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}
     {%- endif %}"""
-# THINKING modes:
-#   off  (default) - thinking hard-disabled. Fastest, and agentic tool calling is
-#                    unaffected: measured 3/3 pass, 0 tool errors, 13s vs 15s for 'low'.
-#   low            - thinking ON but pinned to 'low' regardless of what the client sends.
-#                    Codex requests xhigh by default and Qwen3.8 then spends its entire
-#                    output budget inside <think>, so never leave this unpinned.
-#   keep           - honour whatever effort the client sends (stock behaviour).
-#
-# CORRECTION (2026-08-19): this file previously claimed THINKING=off "BREAKS Codex tool
-# calling: the model stops after a sentence instead of invoking tools". That was a
-# misattribution. The real cause was Codex's `tool_mode: code_mode_only` on the
-# gpt-5.6-* slugs offering only a freeform `exec` tool -- see CODEX.md. Retested after
-# that fix: thinking off is fine.
-MODE = os.environ.get("THINKING", "off").lower()
-if MODE not in ("low", "off", "keep"):
-    sys.exit("THINKING must be one of: low, off, keep")
 
-if MODE == "low":
-    EFFORT_NEW = """    {%- set resolved_reasoning_effort = 'low' %}{#- PATCH: effort pinned to low -#}"""
-else:
-    EFFORT_NEW = """    {%- set _requested_effort = reasoning_effort|default('xhigh') %}
+EFFORT_NEW = """    {%- set _requested_effort = reasoning_effort|default('xhigh') %}{#- PATCH: clamp instead of raising -#}
     {%- if _requested_effort in ('xhigh', 'medium', 'low') %}
         {%- set resolved_reasoning_effort = _requested_effort %}
     {%- elif _requested_effort in ('high', 'max', 'highest') %}
@@ -87,41 +89,61 @@ else:
     {%- else %}
         {%- set resolved_reasoning_effort = 'medium' %}
     {%- endif %}"""
-if EFFORT_OLD not in t:
-    sys.exit("anchor 3 (reasoning effort guard) not found -- template changed upstream")
-t = t.replace(EFFORT_OLD, EFFORT_NEW, 1)
 
-# Fallback: a stray non-leading developer message renders as a user turn rather than failing.
-OLD = """    {%- elif message.role == "user" %}
-        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}"""
-NEW = """    {%- elif message.role == "user" or message.role == "developer" %}
-        {{- '<|im_start|>user\\n' + content + '<|im_end|>' + '\\n' }}"""
-if OLD not in t:
-    sys.exit("anchor 2 (user branch) not found -- template changed upstream")
-t = t.replace(OLD, NEW, 1)
+# --- 3. optional: hardcode thinking off ---------------------------------------------
 
-# Hard-disable thinking. Codex always sends a reasoning effort (its default for these
-# slugs is xhigh), and Qwen3.8 reasons very verbosely under that instruction -- measured
-# at 100% of the output budget spent inside <think> with no answer emitted. There is no
-# "off" reasoning level to select, and vLLM has no flag to force chat-template kwargs,
-# so it is enforced in the template itself.
-#
-# Set THINKING=keep to build a template that honours enable_thinking/reasoning_effort.
-if MODE == "off":
-    # 1. Never inject the "Reasoning effort is set to ..." system instruction.
-    OLD_GATE = "{%- if enable_thinking is undefined or enable_thinking is true %}"
-    NEW_GATE = "{%- if false %}{#- PATCH: thinking hard-disabled -#}"
-    if OLD_GATE not in t:
-        sys.exit("anchor 4 (enable_thinking gate) not found -- template changed upstream")
-    t = t.replace(OLD_GATE, NEW_GATE, 1)
+THINK_GATE_OLD = "{%- if enable_thinking is undefined or enable_thinking is true %}"
+THINK_GATE_NEW = "{%- if false %}{#- PATCH: thinking hard-disabled -#}"
+GEN_GATE_OLD = "    {%- if enable_thinking is defined and enable_thinking is false %}"
+GEN_GATE_NEW = "    {%- if true %}{#- PATCH: always open with a closed, empty think block -#}"
 
-    # 2. Always open the assistant turn with an already-closed, empty think block, so
-    #    the model emits its answer directly instead of reasoning first.
-    OLD_GEN = "    {%- if enable_thinking is defined and enable_thinking is false %}"
-    NEW_GEN = "    {%- if true %}{#- PATCH: always emit a closed empty think block -#}"
-    if OLD_GEN not in t:
-        sys.exit("anchor 5 (generation prompt gate) not found -- template changed upstream")
-    t = t.replace(OLD_GEN, NEW_GEN, 1)
 
-open(DST, "w", encoding="utf-8").write(t)
-print("wrote", DST, len(t), "bytes", "(THINKING=%s)" % MODE)
+def replace_once(text: str, old: str, new: str, what: str) -> str:
+    if old not in text:
+        sys.exit(
+            "anchor not found: %s\n"
+            "The upstream template has changed. Compare it against the strings in this "
+            "script rather than editing the template by hand." % what)
+    return text.replace(old, new, 1)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("src", help="the model's stock chat_template.jinja")
+    ap.add_argument("dst", help="where to write the patched template")
+    ap.add_argument(
+        "--clamp-effort", action="store_true",
+        help="map unknown reasoning efforts onto supported ones instead of raising a "
+             "Jinja error. Unnecessary if the adapter remaps efforts for you; useful as "
+             "a safety net, or for a client the adapter does not sit in front of.")
+    ap.add_argument(
+        "--disable-thinking", action="store_true",
+        help="hardcode thinking off in the template itself. Only for setups without the "
+             "adapter -- it cannot be re-enabled per request, and it overrides any "
+             "thinking policy you configure.")
+    args = ap.parse_args(argv)
+
+    with open(args.src, encoding="utf-8") as fh:
+        t = fh.read()
+
+    t = replace_once(t, ANCHOR_NO_MESSAGES, FOLD_LEADING, "no-messages guard")
+    t = replace_once(t, USER_BRANCH_OLD, USER_BRANCH_NEW, "user-role branch")
+
+    applied = ["developer-role"]
+    if args.clamp_effort:
+        t = replace_once(t, EFFORT_OLD, EFFORT_NEW, "reasoning-effort guard")
+        applied.append("clamp-effort")
+    if args.disable_thinking:
+        t = replace_once(t, THINK_GATE_OLD, THINK_GATE_NEW, "enable_thinking gate")
+        t = replace_once(t, GEN_GATE_OLD, GEN_GATE_NEW, "generation-prompt gate")
+        applied.append("disable-thinking")
+
+    with open(args.dst, "w", encoding="utf-8") as fh:
+        fh.write(t)
+    print("wrote %s (%d bytes); patches applied: %s"
+          % (args.dst, len(t), ", ".join(applied)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

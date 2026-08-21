@@ -72,21 +72,51 @@ The adapter removes non-function tools, so the model uses the shell instead. Nei
 `apply_patch_tool_type: "function"` nor `-c features.apply_patch_freeform=false` changes
 the declaration.
 
-## `Unexpected message role.` or a Jinja error mentioning `reasoning_effort`
+## `Unexpected message role.`
 
-Chat-template problem, not an adapter problem. Qwen3.5/3.8's stock template rejects
-Codex's `developer` role and accepts only `low`/`medium`/`xhigh` for `reasoning_effort`,
-while Codex may send `high` or `minimal`. Generate a patched template with
-`tools/patch_chat_template.py` and pass it via `--chat-template`.
+Chat-template problem, not an adapter problem: Qwen3.5/3.8's stock template does not know
+Codex's `developer` role. Generate a patched template with `tools/patch_chat_template.py`
+and pass it via `--chat-template`.
 
-## The model spends its whole output budget thinking and returns nothing
+## `400 Unexpected reasoning effort high. Supported types are xhigh, medium, and low.`
 
-Codex requests `reasoning_effort: xhigh` by default. There is no "off" level and vLLM
-cannot force template kwargs, so the template must hard-disable thinking. Build it with
-`THINKING=off` (the default in `tools/patch_chat_template.py`).
+You set `model_reasoning_effort = "high"` (or `"minimal"`) in `~/.codex/config.toml`.
+Qwen's template knows only `low`/`medium`/`xhigh` and raises on anything else.
 
-Disabling thinking does **not** hurt tool calling — measured 3/3 pass with 0 tool errors
-either way, and it is ~13% faster.
+The adapter's **default** policy already prevents this: the raise lives inside the
+`enable_thinking` block, and a disabled block cannot raise. If you want thinking *on*,
+use `--thinking on`, which remaps `high`→`xhigh` and `minimal`→`low` instead of
+forwarding a name the template will reject. See [THINKING.md](THINKING.md).
+
+## The model thinks when I did not ask it to
+
+Codex sends `reasoning: {"summary": "auto"}` with **no `effort`**, and Qwen's template
+reads a missing effort as `xhigh` with thinking on — so a default install lands on the
+most expensive setting available. The adapter disables thinking on every request unless
+you configure otherwise. If you still see thinking, check:
+
+* `--thinking keep` is not set (that mode deliberately injects nothing);
+* the template actually declares the variable — `grep -c enable_thinking
+  chat_template.jinja`. If it is 0 the template ignores the kwarg and only effort
+  remapping will help;
+* the model is not reasoning-only (gpt-oss, DeepSeek-R1), which has no off switch at all.
+
+Turning thinking off does **not** hurt tool calling: measured 3/3 agentic passes with 0
+tool errors either way, and it is faster (13 s vs 17 s mean). See [THINKING.md](THINKING.md).
+
+## `400 tool type namespace not supported` / `tool type custom not supported`
+
+Codex declares tools that are not plain JSON functions — `apply_patch` as `custom`, a
+`namespace`-typed multi-agent tool, `web_search`. Backends reject or mishandle these. The
+adapter removes them, which is what makes the shell path work instead. Seeing this error
+means traffic is reaching vLLM without passing through the adapter — check that Codex's
+`base_url` points at the adapter's port, not vLLM's.
+
+## `500 HarmonyError: Unexpected token N while expecting start token 200006`
+
+Not an adapter problem, and not fixable by one. On gpt-oss under vLLM 0.27.1 this fires
+the moment the model emits a tool call, with or without Codex involved. See
+[MODEL-COMPATIBILITY.md](MODEL-COMPATIBILITY.md) for the isolation steps.
 
 ## `Failed to run pre-sampling compact` when resuming a long thread
 

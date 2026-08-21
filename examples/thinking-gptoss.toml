@@ -1,0 +1,23 @@
+# Thinking policy for Harmony models (gpt-oss family).
+#
+#   codex-vllm-adapter --thinking-config examples/thinking-gptoss.toml ...
+#
+# These models reason unconditionally: there is no `enable_thinking` in the template, so
+# the adapter's "off" cannot switch anything off. What matters instead is that Harmony
+# accepts ONLY low / medium / high and returns a 400 for anything else -- including
+# `none`, which is the value most "disable thinking" advice tells you to send.
+#
+# So every level is mapped onto a name Harmony knows. Measured against gpt-oss-20b on
+# vLLM 0.27.1; see docs/MODEL-COMPATIBILITY.md for why that combination was not usable
+# with Codex at the time of writing, for reasons unrelated to this file.
+
+[thinking]
+default = "medium"
+
+none    = "low"      # sending "none" verbatim is a 400 on Harmony
+minimal = "low"
+low     = "low"
+medium  = "medium"
+high    = "high"
+xhigh   = "high"     # 400 if forwarded unchanged
+max     = "high"     # 400 if forwarded unchanged

@@ -7,13 +7,18 @@ result is not a clean error — it looks like a bad model:
 
 > the model replies with one sentence and then stops instead of doing the work
 
-This is a ~200-line, zero-dependency proxy that sits in front of **stock, unmodified
-vLLM** and removes exactly those things. No forked image, no patched source.
+This is a small, zero-dependency proxy that sits in front of **stock, unmodified vLLM**
+and rewrites exactly those things. No forked image, no patched source.
 
 ```
 Codex CLI ──▶ codex-vllm-adapter ──▶ vLLM (official image)
               strips 4 request shapes    responses stream straight back, unparsed
+              sets the thinking policy
 ```
+
+Tested end to end on **Qwen3.8-27B-FP8**; see
+[docs/MODEL-COMPATIBILITY.md](docs/MODEL-COMPATIBILITY.md) for what that does and does not
+imply about your model.
 
 ## Quick start
 
@@ -21,6 +26,8 @@ Codex CLI ──▶ codex-vllm-adapter ──▶ vLLM (official image)
 pip install codex-vllm-adapter        # or: git clone && pip install -e .
 codex-vllm-adapter --upstream http://127.0.0.1:8000 --listen 127.0.0.1:8010
 ```
+
+Add `-v` to see what it changes per request, `--thinking on` to let the model reason.
 
 Point Codex at the adapter in `~/.codex/config.toml`:
 
@@ -51,7 +58,7 @@ Then run `codex`. Requires **Codex CLI ≥ 0.148** (older versions use `wire_api
 > This single setting is the difference between "the model is useless" and "the model
 > works". See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 
-## What it removes
+## What it changes
 
 | Request shape | Without the adapter |
 | --- | --- |
@@ -60,6 +67,12 @@ Then run `codex`. Requires **Codex CLI ≥ 0.148** (older versions use `wire_api
 | `encrypted_content` on reasoning items | `400 — Encrypted content is not supported.` |
 | `compaction` items | `500` — `'ResponseCompactionItem' object has no attribute 'get'`, which Codex shows as "Reconnecting… 1/5" then "experiencing high demand" |
 | `custom_tool_call` / `custom_tool_call_output` records | `500` — `'ResponseCustomToolCall' object has no attribute 'get'`. These dominate real history: one 11,386-item thread held 12,120 of each |
+
+and one thing it *sets* rather than removes:
+
+| Request field | Why |
+| --- | --- |
+| `chat_template_kwargs.enable_thinking` | Codex sends no reasoning effort by default, which Qwen's template reads as *maximum* thinking. Off at every level unless you say otherwise — `--thinking on`, or per level via `--thinking-config`. Two of the five efforts Codex can send (`high`, `minimal`) are otherwise a **400**. See [docs/THINKING.md](docs/THINKING.md) |
 
 Everything else is forwarded byte-for-byte. Only `POST /v1/responses` is touched;
 `/v1/models`, `/v1/chat/completions` and `/metrics` pass straight through. Responses are
@@ -74,7 +87,8 @@ Measured against **stock `vllm/vllm-openai:v0.27.1`**, same server, adapter on a
 | Protocol suite (one request per failure mode) | 3/5 | **5/5** |
 | Codex agentic task ×3 (edit a file, run it, verify) | — | **3/3, 0 tool errors, 2 real tool calls each** |
 | Resume a real 11,386-item recorded thread | `500` ×30, then gives up | **pass in one request, 0 retries** |
-| Unit tests (no GPU, no vLLM) | — | **12/12 in ~1 ms** |
+| Every reasoning effort Codex can send | 2 of 6 are `400` | **6/6 accepted** |
+| Unit tests (no GPU, no vLLM) | — | **33/33 in ~10 ms** |
 
 On that resume the adapter removed 108 `custom_tool_call`, 111 `custom_tool_call_output`
 and 1 `compaction` item, and stripped `encrypted_content` from 55 reasoning items —
@@ -82,22 +96,24 @@ after which the model correctly summarised a conversation it had never seen in i
 original form.
 
 Model under test: Qwen3.8-27B-FP8 on an H800. The adapter itself is model-agnostic; only
-the chat template in `tools/` is Qwen-specific.
+the chat template helper in `tools/` is Qwen-specific. A second family (gpt-oss-20b) was
+spot-checked, with instructive results — see
+[docs/MODEL-COMPATIBILITY.md](docs/MODEL-COMPATIBILITY.md).
 
 ## Also needed for Qwen3.5 / Qwen3.8
 
 Two things are **not** adapter concerns but will bite you:
 
 1. **Chat template.** The stock template rejects Codex's `developer` role
-   (`Unexpected message role.`) and raises on `reasoning_effort` values it doesn't know.
-   Generate a fixed one and pass it with `--chat-template` (a supported vLLM flag):
+   (`Unexpected message role.`). Generate a fixed one and pass it with `--chat-template`
+   (a supported vLLM flag, so this is configuration and not a fork):
    ```bash
-   python tools/patch_chat_template.py /path/to/model chat_template.codex.jinja
+   python tools/patch_chat_template.py \
+       /path/to/model/chat_template.jinja chat_template.codex.jinja
    vllm serve ... --chat-template chat_template.codex.jinja
    ```
-   It also hard-disables thinking, because Codex requests `xhigh` by default, under
-   which the model spends its entire output budget inside `<think>` and returns nothing.
-   Disabling it costs no tool-calling accuracy and is ~13% faster.
+   That is the only patch it applies by default. Thinking is *not* touched — the stock
+   template already gates it on `enable_thinking`, which the adapter sets per request.
 
 2. **Serve under your real model id**, per the warning above.
 
@@ -117,11 +133,20 @@ The long version, with the comparison table and the evidence, is in
 ## Development
 
 ```bash
-python -m pytest tests/ -q      # or: python tests/test_sanitize.py
+python -m unittest discover -s tests -v     # 33 tests, no GPU, no vLLM, ~10 ms
 ```
 
-The unit tests need no GPU and no vLLM — that is deliberate, and is the main practical
-argument for this design.
+That the unit tests need no GPU and no vLLM is deliberate, and is the main practical
+argument for this design. CI runs them on Python 3.9 / 3.12 / 3.13.
+
+Documentation map:
+
+| File | What is in it |
+| --- | --- |
+| [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | symptom-first index of every error we hit, and its real cause |
+| [docs/THINKING.md](docs/THINKING.md) | reasoning effort: the mechanism, the measurements, the config file |
+| [docs/MODEL-COMPATIBILITY.md](docs/MODEL-COMPATIBILITY.md) | will this work with *your* model — three checks, and a worked counter-example |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | why a proxy rather than a patched vLLM, with the evidence |
 
 ## License
 

@@ -1,0 +1,33 @@
+# Thinking policy for codex-vllm-adapter.
+#
+#   codex-vllm-adapter --thinking-config examples/thinking.toml ...
+#
+# The left-hand side is the reasoning effort your client asks for. Codex sets this from
+# `model_reasoning_effort` in ~/.codex/config.toml, and picks its own default when you
+# do not. The right-hand side is what the model is actually told to do:
+#
+#   "off"     thinking disabled  (adapter sends chat_template_kwargs.enable_thinking=false)
+#   "on"      thinking enabled, client's effort forwarded unchanged
+#   "keep"    adapter injects nothing; vLLM decides from the effort as it normally would
+#   "<level>" thinking enabled, but the model is told to use <level> instead. Valid
+#             levels: none, minimal, low, medium, high, xhigh, max -- but check which
+#             ones YOUR model's chat template accepts. Qwen3.5/3.8 accepts only
+#             low / medium / xhigh and raises a Jinja error on anything else, which is
+#             the main reason this remapping column exists.
+#
+# `default` covers efforts not listed here and requests that carry no effort at all.
+
+[thinking]
+default = "off"
+
+none    = "off"
+minimal = "off"
+low     = "off"
+medium  = "off"
+
+# Turn these two into "xhigh" to get a thinking model at the top two Codex settings,
+# so `model_reasoning_effort = "high"` becomes a real switch. Measured cost on an
+# agentic coding task: see docs/THINKING.md.
+high    = "off"
+xhigh   = "off"
+max     = "off"

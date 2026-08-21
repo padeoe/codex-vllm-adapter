@@ -18,9 +18,17 @@ We verified this by locating each patch in vLLM's source. All of them live in
 | drop non-function tools | same validator | request |
 | skip encrypted reasoning | `utils.py` `_construct_message_from_response_item` | request → prompt |
 | skip compaction / role-less items | same function | request → prompt |
+| thinking on/off and effort remapping | *(nothing — this one was hardcoded into a patched chat template)* | request |
 
-Nothing touches `build_response_output_items`, the output path. That has two
-consequences:
+Nothing touches `build_response_output_items`, the output path.
+
+The thinking policy is the newest entry and the one that tested the thesis hardest, since
+it was originally *not* a request-side fix at all: thinking was hardcoded off inside a
+patched chat template. It turned out vLLM already accepts `chat_template_kwargs` on the
+Responses API, and a client-supplied `enable_thinking` overrides the value vLLM derives —
+so a build-time template edit became a per-request field. See [THINKING.md](THINKING.md).
+
+That has two consequences:
 
 1. An adapter sitting **in front of** stock vLLM can produce an identical effect by
    removing the same things from the request before vLLM ever sees them.
@@ -33,7 +41,7 @@ consequences:
 | | Patch vLLM source | Pre-built image | **Adapter (this project)** |
 | --- | --- | --- | --- |
 | Survives a vLLM upgrade | ✗ anchored to source text | ✗ rebuild + republish | ✓ no coupling to internals |
-| Testable without a GPU | ✗ needs a 27B model on 80GB | ✗ same | ✓ 10 unit tests, ~1 ms |
+| Testable without a GPU | ✗ needs a 27B model on 80GB | ✗ same | ✓ 33 unit tests, ~10 ms |
 | Users run official images | ✓ | ✗ must trust yours | ✓ |
 | Distribution size | ~2 KB of scripts | 21 GB per release | ~10 KB, zero deps |
 | Works with a hosted endpoint | ✗ needs the server | ✗ | ✓ point it anywhere |
@@ -111,7 +119,12 @@ JSON-tool-calling backend can answer. No proxy can repair that, because the tool
 definitions never arrive in a usable form. The fix is a client-side setting: use your
 real model id. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
-**The chat template.** Qwen3.5/3.8's stock template rejects Codex's `developer` role and
-raises on unknown `reasoning_effort` values. That is fixed with a patched template file
-passed via `--chat-template`, which is a supported vLLM flag and not a modification of
-vLLM. `tools/patch_chat_template.py` generates it.
+**The chat template.** Qwen3.5/3.8's stock template rejects Codex's `developer` role.
+That is fixed with a patched template file passed via `--chat-template`, which is a
+supported vLLM flag and not a modification of vLLM. `tools/patch_chat_template.py`
+generates it — and now applies only that one fix, because the reasoning-effort handling it
+used to patch moved into the adapter where it belongs.
+
+**Model capability.** The adapter removes protocol incompatibilities, which is not the
+same as making a model good at agentic work, and cannot rescue a backend bug further down
+the stack. [MODEL-COMPATIBILITY.md](MODEL-COMPATIBILITY.md) has a worked example of each.
