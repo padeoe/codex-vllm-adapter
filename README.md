@@ -1,6 +1,6 @@
 # codex-vllm-adapter
 
-Run **OpenAI Codex CLI** against your own **vLLM** server.
+Run **OpenAI Codex CLI/Desktop** against your own **vLLM** server.
 
 Codex speaks the Responses API, but it sends several things vLLM cannot represent. The
 result is not a clean error — it looks like a bad model:
@@ -11,9 +11,9 @@ This is a small, zero-dependency proxy that sits in front of **stock, unmodified
 and rewrites exactly those things. No forked image, no patched source.
 
 ```
-Codex CLI ──▶ codex-vllm-adapter ──▶ vLLM (official image)
-              strips 4 request shapes    responses stream straight back, unparsed
-              sets the thinking policy
+Codex CLI/Desktop ──▶ codex-vllm-adapter ──▶ vLLM (official)
+                      strips 4 request shapes    responses stream straight back, unparsed
+                      sets the thinking policy
 ```
 
 Tested end to end on **Qwen3.8-27B-FP8**; see
@@ -22,6 +22,49 @@ imply about your model.
 
 ## Quick start
 
+### 1. Start vLLM
+
+Any vLLM ≥ 0.27 serving the **Responses API** will do — the official image, unmodified.
+Qwen3.5/3.8 needs one preparatory step, because its stock chat template does not know
+Codex's `developer` role:
+
+```bash
+python tools/patch_chat_template.py \
+    /models/Qwen3.8-27B-FP8/chat_template.jinja chat_template.codex.jinja
+```
+
+That is the only template change, and `--chat-template` is a supported vLLM flag rather
+than a fork. Then, exactly as measured in this repo (one 80 GB H800):
+
+```bash
+docker run -d --name codex-vllm --gpus all --ipc=host \
+  -v /models/Qwen3.8-27B-FP8:/models/qwen38:ro \
+  -v "$PWD/chat_template.codex.jinja":/etc/chat_template.jinja:ro \
+  -p 127.0.0.1:8000:8000 \
+  --entrypoint vllm vllm/vllm-openai:v0.27.1 serve /models/qwen38 \
+    --served-model-name Qwen3.8-27B-FP8 \
+    --chat-template /etc/chat_template.jinja \
+    --host 0.0.0.0 --port 8000 \
+    --gpu-memory-utilization 0.72 \
+    --max-model-len 262144 \
+    --enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice --tool-call-parser qwen3_coder
+```
+
+Two flags carry more weight than they look:
+
+* `--served-model-name` must be your **real** model id — see the warning below;
+* `--enable-auto-tool-choice --tool-call-parser` is what makes tool calling work at all.
+  Pick the parser that matches your model family (`ls vllm/tool_parsers/` in the image).
+
+The checkpoint ships an MTP head, so adding
+`--speculative-config '{"method":"mtp","num_speculative_tokens":3}'` is roughly a 1.7×
+single-stream speedup. Wait for `Application startup complete`, then confirm with
+`curl -s http://127.0.0.1:8000/v1/models`.
+
+### 2. Start the adapter
+
 ```bash
 pip install codex-vllm-adapter        # or: git clone && pip install -e .
 codex-vllm-adapter --upstream http://127.0.0.1:8000 --listen 127.0.0.1:8010
@@ -29,7 +72,9 @@ codex-vllm-adapter --upstream http://127.0.0.1:8000 --listen 127.0.0.1:8010
 
 Add `-v` to see what it changes per request, `--thinking on` to let the model reason.
 
-Point Codex at the adapter in `~/.codex/config.toml`:
+### 3. Point Codex at the adapter
+
+In `~/.codex/config.toml`:
 
 ```toml
 model_provider = "myvllm"
@@ -45,8 +90,8 @@ wire_api = "responses"
 requires_openai_auth = false
 ```
 
-Then run `codex`. Requires **Codex CLI ≥ 0.148** (older versions use `wire_api =
-"chat"`) and Python ≥ 3.9.
+Then run `codex`, or restart the Desktop app. Requires a Codex build **≥ 0.148** (older
+ones use `wire_api = "chat"`) and Python ≥ 3.9 for the adapter itself.
 
 > ### ⚠️ Do not name your model `gpt-5.6-*`
 >
@@ -100,25 +145,19 @@ the chat template helper in `tools/` is Qwen-specific. A second family (gpt-oss-
 spot-checked, with instructive results — see
 [docs/MODEL-COMPATIBILITY.md](docs/MODEL-COMPATIBILITY.md).
 
-## Also needed for Qwen3.5 / Qwen3.8
+## The two server-side things that are not adapter concerns
 
-Two things are **not** adapter concerns but will bite you:
+Both appear in the quick start; they are called out again because they cause failures
+that look like adapter or model problems and are neither:
 
-1. **Chat template.** The stock template rejects Codex's `developer` role
-   (`Unexpected message role.`). Generate a fixed one and pass it with `--chat-template`
-   (a supported vLLM flag, so this is configuration and not a fork):
-   ```bash
-   python tools/patch_chat_template.py \
-       /path/to/model/chat_template.jinja chat_template.codex.jinja
-   vllm serve ... --chat-template chat_template.codex.jinja
-   ```
-   That is the only patch it applies by default. Thinking is *not* touched — the stock
-   template already gates it on `enable_thinking`, which the adapter sets per request.
+1. **The chat template.** Qwen3.5/3.8's stock template rejects Codex's `developer` role
+   (`Unexpected message role.`). `tools/patch_chat_template.py` fixes that and *only*
+   that — thinking is deliberately left alone, because the stock template already gates
+   it on `enable_thinking`, which the adapter sets per request.
+2. **Serving under your real model id**, per the warning above.
 
-2. **Serve under your real model id**, per the warning above.
-
-`examples/docker-compose.yml` wires the official vLLM image and the adapter together
-with both of these already set.
+`examples/docker-compose.yml` wires the official vLLM image and the adapter together with
+both already set, plus a thinking policy file.
 
 ## Why a proxy and not a patched vLLM image
 
